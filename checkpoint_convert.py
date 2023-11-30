@@ -106,6 +106,14 @@ def add_megatron_checkpoint_args(parser):
             "Only used when converting a Transformers checkpoint to a Megatron checkpoint."
         ),
     )
+    parser.add_argument(
+        "--current_iteration",
+        type=int,
+        default=None,
+        help=(
+            "If None, save this checkpoint as release version, otherwise set saved checkpoint as this number "
+        ),
+    )
     return parser
 
 
@@ -476,7 +484,7 @@ def convert_checkpoint_from_megatron_to_transformers(args):
                 ).to(dtype)
 
             # For layernorm(s), simply store the layer norm.
-            if op_name.endswith("layernorm"):
+            if op_name.endswith("norm"):
                 ln_name = "ln_1" if op_name.startswith("input") else "ln_2"
                 output_state_dict[layer_name + "." + ln_name + "." + weight_or_bias] = params
 
@@ -532,8 +540,15 @@ def convert_checkpoint_from_megatron_to_transformers(args):
     # The final layernorm.
     print("Converting final layernorm")
     params = get_element_from_dict_by_path(tp_state_dicts[0], str(path))
-    output_state_dict["transformer.ln_f.weight"] = params["final_layernorm.weight"].to(dtype)
-    output_state_dict["transformer.ln_f.bias"] = params["final_layernorm.bias"].to(dtype)
+    try:
+        output_state_dict["transformer.ln_f.weight"] = params["final_layernorm.weight"].to(dtype)
+        output_state_dict["transformer.ln_f.bias"] = params["final_layernorm.bias"].to(dtype)
+    except KeyError:
+        try:
+            output_state_dict["transformer.ln_f.weight"] = params["final_norm.weight"].to(dtype)
+            output_state_dict["transformer.ln_f.bias"] = params["final_norm.bias"].to(dtype)
+        except KeyError:
+            print('Can not find Key value final_norm.weight')
 
     # For LM head, transformers' wants the matrix to weight embeddings.
     print("Converting LM head")
@@ -625,12 +640,20 @@ def convert_checkpoint_from_transformers_to_megatron(args):
 
     # Saving the tracker file
     tracker_filepath = os.path.join(args.save_path, "latest_checkpointed_iteration.txt")
-    with open(tracker_filepath, "w") as f:
-        f.write("release")
+    if args.current_iteration is None:
+        with open(tracker_filepath, "w") as f:
+            f.write("release")
 
-    # create `release` dir in args.load_path
-    release_dir = os.path.join(args.save_path, "release")
-    os.makedirs(release_dir, exist_ok=True)
+        # create `release` dir in args.load_path
+        release_dir = os.path.join(args.save_path, "release")
+        os.makedirs(release_dir, exist_ok=True)
+    else:
+        with open(tracker_filepath, "w") as f:
+            f.write(str(args.current_iteration))
+
+        # create `iteration` dir in args.load_path
+        release_dir = os.path.join(args.save_path, "iter_{:07d}".format(args.current_iteration))
+        os.makedirs(release_dir, exist_ok=True)
 
     # megatron args
     megatron_args = {
@@ -791,7 +814,7 @@ def convert_checkpoint_from_transformers_to_megatron(args):
                 params = state_dict[layer_name].to(dtype)
                 # handle layernorm
                 if op_name.startswith("ln"):
-                    out_name = "input_layernorm" if op_name.endswith("1") else "post_attention_layernorm"
+                    out_name = "input_norm" if op_name.endswith("1") else "post_attention_norm"
                     layer_name = f"layers.{layer}.{out_name}.{weight_or_bias}"
 
                 # handle attention K, V, Q weights
@@ -852,7 +875,7 @@ def convert_checkpoint_from_transformers_to_megatron(args):
             # handle final layernorm
             for weight_or_bias in ["weight", "bias"]:
                 params = state_dict[f"transformer.ln_f.{weight_or_bias}"].to(dtype)
-                layer_name = f"final_layernorm.{weight_or_bias}"
+                layer_name = f"final_norm.{weight_or_bias}"
                 for i in range(args.target_tensor_model_parallel_size):
                     params_dict = get_element_from_dict_by_path(output_state_dict[i], "model.language_model.encoder")
                     params_dict[layer_name] = params
@@ -866,13 +889,14 @@ def convert_checkpoint_from_transformers_to_megatron(args):
         for tp_rank in range(args.target_tensor_model_parallel_size):
             output_state_dict[tp_rank]["checkpoint_version"] = 3.0
             output_state_dict[tp_rank]["args"] = margs
+            output_state_dict[tp_rank]["iteration"] = args.current_iteration if args.current_iteration else 0
             checkpoint_dir = (
                 f"mp_rank_{tp_rank:02d}"
                 if args.target_pipeline_model_parallel_size == 1
                 else f"mp_rank_{tp_rank:02d}_{pp_rank:03d}"
             )
             if args.use_distributed_optimizer:
-                checkpoint_name = "model_rng.pt"
+                checkpoint_name = "model_optim_rng.pt"
             else:
                 checkpoint_name = "model_optim_rng.pt"
                 output_state_dict[tp_rank]["optimizer"] = dummy_optim_state_dict["optimizer"]
