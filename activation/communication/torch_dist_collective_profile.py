@@ -9,37 +9,22 @@ import torchvision.transforms as T
 
 from utils.dist_init import Utils
 from utils.general_utils import print_rank_0
+import utils.parallel_state as ps
+import utils.collective_communication as commu
 
-def profile_all_reduce():
-    """create random tensor"""
-    torch_shape = (4,2)
-    torch_shape = (4, 1536, 4096)
-    input = torch.empty(torch_shape, dtype=torch.float16, device=torch.cuda.current_device())
-    copy_input = input.clone()
-
-    """warm up"""
-    for i in range(5):
-        torch.distributed.all_reduce(input)
-        input.copy_(copy_input)
-
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
-    ) as p:
-        torch.distributed.all_reduce(input)
-
-    print(p.key_averages().table(
-        sort_by="self_cuda_time_total", row_limit=-1))
+from activation.analysis.analyze_activation import get_tensor_data
     
 def timer_all_reduce():
-    """create random tensor"""
-    # torch_shape = (4,2)
-    torch_shape = (4, 1536, 4096)
-    input = torch.empty(torch_shape, dtype=torch.float16, device=torch.cuda.current_device())
+    """load checkpoint tensor"""
+    path = '/ocean/projects/asc200010p/jjia1/scripts/gpt_result/gpt_7_5B/013/collective/tensor_parallel/'
+    iteration_num = 'iteration_00600'
+    path = path+iteration_num
+    layer_name = 'ParallelMLP'
+    layer_num = 10
+    tensor_parallel_rank = ps.get_tensor_model_parallel_rank()
+    input = get_tensor_data(path, layer_num, layer_name, tensor_parallel_rank, torch.device(device=tensor_parallel_rank)).detach()
     copy_input = input.clone()
-    """create cida timer"""
+    """create cuda timer"""
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
@@ -56,34 +41,42 @@ def timer_all_reduce():
     print_rank_0('cuda timer: all-reduce: {}ms'.format(start.elapsed_time(end)))
 
 def tensorboard_profile_all_reduce():
-    """create random tensor"""
-    torch_shape = (4,2)
-    torch_shape = (4, 1536, 4096)
-    input = torch.empty(torch_shape, dtype=torch.float16, device=torch.cuda.current_device())
+    """load checkpoint tensor"""
+    path = '/ocean/projects/asc200010p/jjia1/scripts/gpt_result/gpt_7_5B/013/collective/tensor_parallel/'
+    iteration_num = 'iteration_00600'
+    path = path+iteration_num
+    layer_name = 'ParallelMLP'
+    layer_num = 10
+    tensor_parallel_rank = ps.get_tensor_model_parallel_rank()
+    input = get_tensor_data(path, layer_num, layer_name, tensor_parallel_rank, torch.device(device=tensor_parallel_rank)).detach()
     copy_input = input.clone()
 
     """start profiling"""
     prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=5, active=4, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/all_reduce'),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/test_collective/all_reduce_profile'),
             record_shapes=True,
             profile_memory=True,
             with_stack=True)
     prof.start()
     for i in range(10):
         prof.step()
-        torch.distributed.all_reduce(input)
+        commu._reduce(input)
         input.copy_(copy_input)
     prof.stop()
 
 def tensorboard_profile_reduce_scatter_with_all_gather():
-    """create random tensor"""
-    torch_shape = (4,2)
-    torch_shape = (4, 1536, 4096)
-    input = torch.empty(torch_shape, dtype=torch.float16, device=torch.cuda.current_device())
-    copy_input = input.clone()
+    """load checkpoint tensor"""
+    path = '/ocean/projects/asc200010p/jjia1/scripts/gpt_result/gpt_7_5B/013/collective/tensor_parallel/'
+    iteration_num = 'iteration_00600'
+    path = path+iteration_num
+    layer_name = 'ParallelMLP'
+    layer_num = 10
+    tensor_parallel_rank = ps.get_tensor_model_parallel_rank()
+    input = get_tensor_data(path, layer_num, layer_name, tensor_parallel_rank, torch.device(device=tensor_parallel_rank)).detach()
 
     """initizalize buffer"""
+    tensor_model_parallel_size = ps.get_tensor_model_parallel_world_size()
     dim_size = list(input.size())
     assert (
         dim_size[0] % tensor_model_parallel_size == 0
@@ -96,19 +89,20 @@ def tensorboard_profile_reduce_scatter_with_all_gather():
     """start profiling"""
     prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=5, active=4, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/all_reduce'),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/test_collective/reduce_scatter_allgather'),
             record_shapes=True,
             profile_memory=True,
             with_stack=True)
     prof.start()
     for i in range(10):
         prof.step()
-        torch.distributed.all_reduce(input)
-        input.copy_(copy_input)
+        commu._reduce_scatter_along_first_dim(input, reduce_scatter_output)
+        commu._gather_along_first_dim(reduce_scatter_output, gather_output)
     prof.stop()
 
 if __name__ == '__main__':
-    Utils.initialize_distributed()
-    # profile_all_reduce()
-    # tensorboard_profile_all_reduce()
+    world_size = Utils.world_size
+    Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
     timer_all_reduce()
+    tensorboard_profile_all_reduce()
+    tensorboard_profile_reduce_scatter_with_all_gather()
