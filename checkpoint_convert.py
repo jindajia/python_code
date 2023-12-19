@@ -453,6 +453,7 @@ def convert_checkpoint_from_megatron_to_transformers(args):
             else "model.language_model.encoder"
         )
         # Extract the layers.
+        jinda = get_element_from_dict_by_path(tp_state_dicts[0], path).keys()
         for key, val in get_element_from_dict_by_path(tp_state_dicts[0], path).items():
             # Match the name.
             m = layer_re.match(key)
@@ -553,7 +554,7 @@ def convert_checkpoint_from_megatron_to_transformers(args):
     # For LM head, transformers' wants the matrix to weight embeddings.
     print("Converting LM head")
     output_state_dict["lm_head.weight"] = word_embeddings.to(dtype)
-
+    output_state_dict_key = output_state_dict.keys()
     # It should be done!
     print("Conversion from Megatron-LM to Transformers is done!")
 
@@ -576,6 +577,18 @@ def convert_checkpoint_from_megatron_to_transformers(args):
     # Store the config to file.
     print("Saving config")
     config.save_pretrained(args.save_path)
+
+    # Save non model
+    non_model_state = {}
+    non_model_state['optimizer'] = state_dict.get("optimizer", None)
+    non_model_state['rng_state'] = state_dict.get("rng_state", None)
+    if 'lr_scheduler' in state_dict: # backward compatbility
+        non_model_state['lr_scheduler'] = state_dict['lr_scheduler']
+    else:
+        non_model_state['opt_param_scheduler'] = state_dict.get("opt_param_scheduler", None)
+    non_model_state['iteration'] = state_dict.get("iteration", None)
+
+    torch.save(non_model_state, os.path.join(args.save_path, 'non_model_state.pt'))
 
     # Save tokenizer based on args
     if args.tokenizer_name is not None:
@@ -626,6 +639,10 @@ def convert_checkpoint_from_transformers_to_megatron(args):
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         exit(1)
+
+
+    # load non model state
+    non_model_state = torch.load(os.path.join(args.load_path, 'non_model_state.pt'), map_location="cpu")
 
     # load the transformers model state dict and config
     sub_dirs = [x for x in os.listdir(args.load_path) if x.startswith("pytorch_model")]
@@ -711,19 +728,20 @@ def convert_checkpoint_from_transformers_to_megatron(args):
         ],
     }
     if args.use_distributed_optimizer:
+        # dummy_optim_state_dict["optimizer"] = megatron_optimizer
+        # dummy_optim_state_dict["rng_state"] = megatron_rng_state
         for i in range(args.target_pipeline_model_parallel_size):
             for j in range(args.target_tensor_model_parallel_size):
-                for k in range(args.target_data_parallel_size):
-                    if args.target_pipeline_model_parallel_size == 1:
-                        checkpoint_dir = f"mp_rank_{j:02d}_{k:03d}"
-                    else:
-                        checkpoint_dir = f"mp_rank_{j:02d}_{i:03d}_{k:03d}"
-                    checkpoint_dir = os.path.join(release_dir, checkpoint_dir)
-                    os.makedirs(checkpoint_dir, exist_ok=True)
-                    torch.save(
-                        dummy_optim_state_dict,
-                        os.path.join(checkpoint_dir, "optim.pt"),
-                    )
+                if args.target_pipeline_model_parallel_size == 1:
+                    checkpoint_dir = f"mp_rank_{j:02d}"
+                else:
+                    checkpoint_dir = f"mp_rank_{j:02d}_{i:03d}"
+                checkpoint_dir = os.path.join(release_dir, checkpoint_dir)
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                torch.save(
+                    dummy_optim_state_dict,
+                    os.path.join(checkpoint_dir, "distrib_optim.pt"),
+                )
 
     # Convert.
     print("Converting")
@@ -783,6 +801,9 @@ def convert_checkpoint_from_transformers_to_megatron(args):
     heads = config.n_head
     # The hidden_size per head.
     hidden_size_per_head = config.n_embd // config.n_head
+    
+    weight_chunk_dim = [0, -1]
+    bias_chunk_dim = []
     for pp_rank in range(args.target_pipeline_model_parallel_size):
         layer_offset = pp_rank * num_layers
         if pp_rank > 0:
@@ -864,7 +885,15 @@ def convert_checkpoint_from_transformers_to_megatron(args):
                 if op_name + "." + weight_or_bias in tensor_parallel_params:
                     dim = 1 if op_name in ["attn.c_proj", "mlp.c_proj"] else 0
                     params = torch.chunk(params, args.target_tensor_model_parallel_size, dim=dim)
-
+                    if weight_or_bias == 'weight':
+                        weight_chunk_dim.append(dim)
+                    else:
+                        bias_chunk_dim.append(dim)
+                else:
+                    if weight_or_bias == 'weight':
+                        weight_chunk_dim.append(-1)
+                    else:
+                        bias_chunk_dim.append(-1)
                 for i in range(args.target_tensor_model_parallel_size):
                     params_dict = get_element_from_dict_by_path(output_state_dict[i], "model.language_model.encoder")
                     params_dict[layer_name] = (
@@ -897,9 +926,19 @@ def convert_checkpoint_from_transformers_to_megatron(args):
             )
             if args.use_distributed_optimizer:
                 checkpoint_name = "model_optim_rng.pt"
+                if args.current_iteration is None:
+                    output_state_dict[tp_rank]["optimizer"] = dummy_optim_state_dict["optimizer"]
+                else:
+                    for key, value in non_model_state.items():
+                        output_state_dict[tp_rank][key] = value
+                        
             else:
                 checkpoint_name = "model_optim_rng.pt"
-                output_state_dict[tp_rank]["optimizer"] = dummy_optim_state_dict["optimizer"]
+                if args.current_iteration is None:
+                    output_state_dict[tp_rank]["optimizer"] = dummy_optim_state_dict["optimizer"]
+                else:
+                    for key, value in non_model_state.items():
+                        output_state_dict[tp_rank][key] = value
             checkpoint_dir = os.path.join(release_dir, checkpoint_dir)
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
@@ -908,7 +947,7 @@ def convert_checkpoint_from_transformers_to_megatron(args):
                     f"Checkpoint structure of model state dict shard belonging to TP rank {tp_rank} and PP rank"
                     f" {pp_rank}:"
                 )
-                recursive_print(None, output_state_dict[tp_rank])
+            #     recursive_print(None, output_state_dict[tp_rank])
             torch.save(output_state_dict[tp_rank], checkpoint_path)
 
 

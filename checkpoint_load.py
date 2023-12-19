@@ -17,9 +17,63 @@ def param_provider(rank = 0, iter = 100, base_path = '') -> List[Tensor]:
     param_buffer = torch.load(params_path, map_location=torch.device('cpu'))
     return param_buffer
 
+def recursive_print(name, val, spaces=0):
+    """
+    Recursively print the structure of a checkpoint. This function is taken from `convert_megatron_gpt2_checkpoint.py`
+
+    Args:
+        name (str): the name of the current tensor parameter
+        val (Tuple(int)): the shape of the current tensor parameter
+        spaces (int): the number of spaces to print before the output for a nested structure
+    """
+    # Format the message.
+    if name is None:
+        msg = None
+    else:
+        fmt = "." * max(0, spaces - 2) + "# {:" + str(50 - spaces) + "s}"
+        msg = fmt.format(name)
+
+    # Print and recurse (if needed).
+    if isinstance(val, dict):
+        if msg is not None:
+            print(msg)
+        for k in val.keys():
+            recursive_print(k, val[k], spaces + 2)
+    elif isinstance(val, torch.Tensor):
+        print(msg, ":", val.size())
+    else:
+        print(msg, ":", val)
+
+def dist_optim_provider(rank = 0, iter = 100, base_path = '') -> List[Tensor]:
+    mp_rank = 'mp_rank_{:02d}'.format(rank)
+
+    """import dist optim checkpoint"""
+    iteration_num_cur = 'iter_{:07d}'.format(iter)
+    distrib_optim_path = os.path.join(base_path, iteration_num_cur, mp_rank, 'distrib_optim.pt')
+    distrib_optim_state = torch.load(distrib_optim_path, map_location=torch.device('cpu'))
+    return distrib_optim_state
+
 def print_dp_tp_baseline():
-    dp_baseline = '/ocean/projects/asc200010p/jjia1/scripts/gpt_result/codeparrot/debug/collect_params/checkpoint'
-    state_dict = param_provider(0, 2000, dp_baseline)
+    # dp_baseline = '/ocean/projects/asc200010p/jjia1/scripts/gpt_result/codeparrot/debug/continue_tensor_parallel_training/converted_checkpoint'
+    # state_dict = param_provider(0, 22000, dp_baseline)
+
+    dp_baseline = '/ocean/projects/asc200010p/jjia1/scripts/gpt_result/codeparrot/tp4_checkpoint'
+    state_dict = param_provider(0, 2800, dp_baseline)
+
+    # dp_baseline = '/ocean/projects/asc200010p/jjia1/scripts/gpt_result/codeparrot/baseline/checkpoint'
+    state_dict_keys = state_dict.keys()
+
+    # recursive print
+    recursive_print('', state_dict['model'])
+
+    fp32_from_fp16_params = state_dict['optimizer']['fp32_from_fp16_params']
+    print('fp32_from_fp16_params length', len(fp32_from_fp16_params))
+    for i, params in enumerate(fp32_from_fp16_params):
+        print('fp32_from_fp16_params[{}] length: {}'.format(i, len(params)))
+        for j, data in enumerate(params):
+            print(data.shape)
+
+    # optim_state = dist_optim_provider(0, 2000, dp_baseline)
     print('dp_baseline {}'.format(state_dict.keys()))
     print('dp_baseline args: {}\n checkpoint_version: {}\n model: {}\n rng_state: {}\n'.format(state_dict['args'], state_dict['checkpoint_version'], state_dict['model']['language_model'].keys(), state_dict['rng_state'][0].keys()))
     # tp4_baseline = '/N/slate/jindjia/bash_scripts/gpt/codeparrot-small/tensor-parallel/baseline/checkpoint'

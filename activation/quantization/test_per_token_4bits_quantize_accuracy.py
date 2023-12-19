@@ -11,6 +11,7 @@ from utils.per_tensor_quantize import (
     )
 import torch
 import sys
+import math
 
 sys.path.insert(1, '/ocean/projects/asc200010p/jjia1/scripts/analysis/')
 from jindatools.analysis import calculate_sparsity, tensor_draw_ans_dictionary, tensor_norm, analysis_data_info, analysis_diff
@@ -26,7 +27,7 @@ def tensorboard_profile_all_reduce(input: torch.tensor):
     """start profiling"""
     prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=15, active=4, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/test_accuracy_halfto8bits/all_reduce_profile'),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/test_accuracy_4bits_quantize/all_reduce_profile'),
             record_shapes=True,
             profile_memory=True,
             with_stack=True)
@@ -57,16 +58,17 @@ def tensorboard_profile_reduce_scatter_with_all_gather(input: torch.tensor):
     dim_size[0] = dim_size[0] // tensor_model_parallel_size
     reduce_scatter_output = torch.empty(dim_size, dtype=input.dtype, device=torch.cuda.current_device())
     qdim_size = list(reshape_to_2d(dim_size))
+    dim_size = list(input.size())
     row_dim = qdim_size[-1]
-    qdim_size[-1] = qdim_size[-1] + 2 * 4 # because for each row, the last eight bytes will be used to save scale and min value, (min value will be used to calculate zero point)
+    qdim_size[-1] = math.ceil(qdim_size[-1] / 2) + 2 * 2 # If original datatype is half, for each row, the last four bytes will be used to save scale and min value, (min value will be used to calculate zero point)
     qdim_size[0] = qdim_size[0] * tensor_model_parallel_size
     gather_output = torch.empty(qdim_size, dtype=torch.uint8, device=torch.cuda.current_device())
-    dim_size = list(input.size())
+    bit_rate = 4
 
     """start profiling"""
     prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=15, active=4, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/test_accuracy_halfto8bits/reduce_scatter_allgather'),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('/ocean/projects/asc200010p/jjia1/scripts/result/log/test_accuracy_4bits_quantize/reduce_scatter_allgather'),
             record_shapes=True,
             profile_memory=True,
             with_stack=True)
@@ -78,7 +80,7 @@ def tensorboard_profile_reduce_scatter_with_all_gather(input: torch.tensor):
         commu._reduce_scatter_along_first_dim(input, reduce_scatter_output)
         """quantize tensor reduce scatter output into quantized tensor"""
         input_2d = reduce_scatter_output.view((-1, row_dim)) if row_dim > 0 else reduce_scatter_output
-        quantized_tensor = torch.ops.fbgemm.HalfToFused8BitRowwiseQuantized(input_2d)
+        quantized_tensor = torch.ops.fbgemm.HalfToFusedNBitRowwiseQuantizedSBHalf(input_2d, bit_rate)
         """gather quantize tensor"""
         print_rank_0('quantized_tensor shape: {}, input_2d shape: {}'.format(quantized_tensor.shape, input_2d.shape))
         commu._gather_along_first_dim(quantized_tensor, gather_output)
@@ -87,7 +89,7 @@ def tensorboard_profile_reduce_scatter_with_all_gather(input: torch.tensor):
             gather_output.size(0) % ps.get_tensor_model_parallel_world_size() == 0
         ), "gathered data has uneven data"
         split_tensors = torch.split(gather_output, gather_output.size(0) // ps.get_tensor_model_parallel_world_size(), dim=0)
-        dequantized_tensors = [torch.ops.fbgemm.Fused8BitRowwiseQuantizedToHalf(q_tensor) for q_tensor in split_tensors]
+        dequantized_tensors = [torch.ops.fbgemm.FusedNBitRowwiseQuantizedSBHalfToHalf(q_tensor, bit_rate) for q_tensor in split_tensors]
         full_tensor = torch.cat(dequantized_tensors, dim=0).view(dim_size)
     prof.stop()
     return full_tensor
