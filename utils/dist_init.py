@@ -1,11 +1,12 @@
 import os
 import torch
 import utils.parallel_state as ps
+from utils.general_utils import print_rank_0
 
 class Utils:
 
-    world_size = torch.cuda.device_count()
-    rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.getenv("WORLD_SIZE", '1'))
+    rank = int(os.getenv('RANK', '0'))
 
     @staticmethod
     def initialize_distributed():
@@ -27,4 +28,6 @@ class Utils:
         ps.destroy_model_parallel()
         if not torch.distributed.is_initialized():
             Utils.initialize_distributed()
+            print_rank_0("JINDA_DEBUG not initialized")
+        print_rank_0("JINDA_DEBUG ps initialized")
         ps.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, pipeline_model_parallel_split_rank)
